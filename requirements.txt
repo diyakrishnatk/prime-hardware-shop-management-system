@@ -6,3 +6,4 @@ psycopg2-binary
 reportlab
 Pillow
 requests
+django-cloudinary-storage
