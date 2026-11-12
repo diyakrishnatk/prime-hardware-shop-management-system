@@ -11,9 +11,16 @@ import random
 from .models import Product, Customer, Bill, BillItem, CartItem, Feedback, WalkinCustomer, Brand
 from .models import NewsletterSubscriber
 from django.http import HttpResponseRedirect, HttpResponse
-from django.template.loader import get_template
-from xhtml2pdf import pisa
-import io
+from io import BytesIO
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.enums import TA_CENTER, TA_RIGHT
+from reportlab.lib.units import cm
+from reportlab.platypus import (
+    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+)
+from xml.sax.saxutils import escape
 from django.core.mail import send_mail, get_connection, EmailMultiAlternatives
 from django.conf import settings
 import time
@@ -1258,29 +1265,223 @@ def track_order(request, order_id):
         order = get_object_or_404(Bill, id=order_id, customer__user=request.user)
     return render(request, 'shop/track_order.html', {'order': order})
 
+
 @login_required
 def download_bill(request, bill_id):
     if request.user.is_staff:
         bill = get_object_or_404(Bill, id=bill_id)
     else:
-        bill = get_object_or_404(Bill, id=bill_id, customer__user=request.user)
-    items = bill.items.all()
-    
-    template_path = 'shop/bill_pdf.html'
-    context = {'bill': bill, 'items': items}
-    
+        bill = get_object_or_404(
+            Bill, id=bill_id, customer__user=request.user
+        )
+
+    items = bill.items.select_related('product').all()
+
+    buffer = BytesIO()
+
     response = HttpResponse(content_type='application/pdf')
-    response['Content-Disposition'] = f'attachment; filename="bill_{bill.id}.pdf"'
-    
-    template = get_template(template_path)
-    html = template.render(context)
-    
-    # create a pdf
-    pisa_status = pisa.CreatePDF(
-       html, dest=response)
-    
-    if pisa_status.err:
-       return HttpResponse('We had some errors <pre>' + html + '</pre>')
+    response['Content-Disposition'] = (
+        f'attachment; filename="bill_{bill.id}.pdf"'
+    )
+
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=A4,
+        rightMargin=1.5 * cm,
+        leftMargin=1.5 * cm,
+        topMargin=1.5 * cm,
+        bottomMargin=1.5 * cm
+    )
+
+    styles = getSampleStyleSheet()
+
+    title_style = ParagraphStyle(
+        'InvoiceTitle',
+        parent=styles['Title'],
+        textColor=colors.HexColor('#1e40af'),
+        alignment=TA_CENTER,
+        fontSize=22,
+        spaceAfter=8
+    )
+
+    normal = styles['Normal']
+    story = []
+
+    # Company heading
+    story.append(Paragraph('PRIME HARDWARE', title_style))
+    story.append(Paragraph(
+        'Metro Complex, Convent Road, Vadakara',
+        ParagraphStyle(
+            'Company',
+            parent=normal,
+            alignment=TA_CENTER
+        )
+    ))
+    story.append(Paragraph(
+        'Phone: Contact the shop | Email: Prime Hardware',
+        ParagraphStyle(
+            'CompanyInfo',
+            parent=normal,
+            alignment=TA_CENTER
+        )
+    ))
+    story.append(Spacer(1, 20))
+
+       # Invoice information
+    cell_style = ParagraphStyle(
+        'InvoiceCell',
+        parent=normal,
+        fontSize=8,
+        leading=12,
+        wordWrap='CJK'
+    )
+
+    header_style = ParagraphStyle(
+        'InvoiceHeader',
+        parent=normal,
+        textColor=colors.white,
+        fontName='Helvetica-Bold',
+        fontSize=9
+    )
+
+    invoice_data = [
+        [
+            Paragraph('INVOICE DETAILS', header_style),
+            Paragraph('CUSTOMER DETAILS', header_style)
+        ],
+        [
+            Paragraph(
+                f'Invoice No: {bill.id}<br/>'
+                f'Date: {bill.created_at.strftime("%d-%m-%Y")}<br/>'
+                f'Payment: {escape(str(bill.payment_method or ""))}<br/>'
+                f'Status: {escape(str(bill.payment_status or ""))}',
+                cell_style
+            ),
+            Paragraph(
+                f'Name: {escape(str(bill.billing_name or ""))}<br/>'
+                f'Phone: {escape(str(bill.billing_phone or ""))}<br/>'
+                f'Email: {escape(str(bill.billing_email or ""))}<br/>'
+                f'Location: {escape(str(bill.billing_location or ""))}<br/>'
+                f'Address: {escape(str(bill.billing_address or ""))}',
+                cell_style
+            )
+        ]
+    ]
+
+    info_table = Table(
+        invoice_data,
+        colWidths=[8.5 * cm, 8.5 * cm]
+    )
+
+    info_table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#1e40af')),
+        ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+        ('PADDING', (0, 0), (-1, -1), 8),
+    ]))
+
+    story.append(info_table)
+    story.append(Spacer(1, 20))
+
+    # Product table
+    story.append(Paragraph('ITEM DETAILS', styles['Heading2']))
+    story.append(Spacer(1, 8))
+
+    table_data = [
+        ['No.', 'Product', 'Category', 'Qty', 'Rate (Rs.)', 'Amount (Rs.)']
+    ]
+
+    for index, item in enumerate(items, start=1):
+        product_name = escape(str(item.product.name))
+        category = escape(str(item.product.category or ''))
+        quantity = item.quantity
+        price = float(item.price)
+        amount = quantity * price
+
+        table_data.append([
+            str(index),
+            Paragraph(product_name, normal),
+            Paragraph(category, normal),
+            str(quantity),
+            f'{price:,.2f}',
+            f'{amount:,.2f}'
+        ])
+
+    product_table = Table(
+        table_data,
+        colWidths=[0.8*cm, 5.0*cm, 3.2*cm, 1.2*cm, 3.0*cm, 3.0*cm],
+        repeatRows=1
+    )
+
+    product_table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#1e40af')),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+        ('ALIGN', (0, 0), (0, -1), 'CENTER'),
+        ('ALIGN', (3, 1), (-1, -1), 'RIGHT'),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ('PADDING', (0, 0), (-1, -1), 7),
+    ]))
+
+    story.append(product_table)
+    story.append(Spacer(1, 15))
+
+    # Grand total
+    total_data = [
+        ['Grand Total', f'Rs. {float(bill.total_amount):,.2f}']
+    ]
+
+    total_table = Table(total_data, colWidths=[13*cm, 4*cm])
+    total_table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor('#dbeafe')),
+        ('FONTNAME', (0, 0), (-1, -1), 'Helvetica-Bold'),
+        ('ALIGN', (1, 0), (1, 0), 'RIGHT'),
+        ('PADDING', (0, 0), (-1, -1), 10),
+    ]))
+
+    story.append(total_table)
+    story.append(Spacer(1, 30))
+
+    story.append(Paragraph(
+        '<b>Terms & Conditions</b><br/>'
+        '1. Goods once sold will not be taken back.<br/>'
+        '2. Please keep your invoice for future reference.<br/>'
+        '3. Thank you for shopping with Prime Hardware!',
+        normal
+    ))
+
+    story.append(Spacer(1, 35))
+
+    story.append(Paragraph(
+        'Authorized Signature: ____________________',
+        ParagraphStyle(
+            'Signature',
+            parent=normal,
+            alignment=TA_RIGHT
+        )
+    ))
+
+    def add_footer(canvas, document):
+        canvas.saveState()
+        canvas.setFont('Helvetica', 8)
+        canvas.drawCentredString(
+            A4[0] / 2,
+            0.8 * cm,
+            f'Prime Hardware | Page {document.page}'
+        )
+        canvas.restoreState()
+
+    doc.build(
+        story,
+        onFirstPage=add_footer,
+        onLaterPages=add_footer
+    )
+
+    pdf = buffer.getvalue()
+    buffer.close()
+
+    response.write(pdf)
     return response
 
 # Newsletters
@@ -1710,19 +1911,92 @@ def admin_sales_report(request):
         'settings': settings,
     }
     
-    template = get_template('shop/admin_report_pdf.html')
-    html = template.render(context)
-    
-    result = io.BytesIO()
-    pdf = pisa.pisaDocument(io.BytesIO(html.encode("UTF-8")), result)
-    
-    if not pdf.err:
-        response = HttpResponse(result.getvalue(), content_type='application/pdf')
-        filename = f"SaleReport_{timezone.now().strftime('%Y%m%d')}.pdf"
-        response['Content-Disposition'] = f'inline; filename="{filename}"'
-        return response
-    
-    return HttpResponse("Error generating PDF", status=500)
+    buffer = BytesIO()
+
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=A4,
+        rightMargin=1.5 * cm,
+        leftMargin=1.5 * cm,
+        topMargin=1.5 * cm,
+        bottomMargin=1.5 * cm
+    )
+
+    styles = getSampleStyleSheet()
+    elements = []
+
+    elements.append(Paragraph("PRIME HARDWARE", styles["Title"]))
+    elements.append(Spacer(1, 10))
+    elements.append(Paragraph(report_title, styles["Heading2"]))
+    elements.append(Paragraph(
+        f"Generated: {timezone.now().strftime('%d-%m-%Y %H:%M')}",
+        styles["Normal"]
+    ))
+    elements.append(Spacer(1, 15))
+
+    summary_data = [
+        ["Total Bills", "Total Revenue", "Paid", "Balance"],
+        [
+            str(total_sales),
+            f"Rs. {total_revenue}",
+            f"Rs. {total_paid}",
+            f"Rs. {total_revenue - total_paid}"
+        ]
+    ]
+
+    summary_table = Table(summary_data, colWidths=[4 * cm] * 4)
+    summary_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#263B5E")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+        ("PADDING", (0, 0), (-1, -1), 8),
+    ]))
+
+    elements.append(summary_table)
+    elements.append(Spacer(1, 20))
+
+    elements.append(Paragraph("Sales Details", styles["Heading2"]))
+
+    table_data = [[
+        "Bill ID", "Date", "Payment Status", "Order Status", "Amount"
+    ]]
+
+    for bill in bills:
+        table_data.append([
+            str(bill.id),
+            bill.created_at.strftime("%d-%m-%Y"),
+            str(bill.payment_status),
+            str(bill.order_status),
+            f"Rs. {bill.total_amount}"
+        ])
+
+    sales_table = Table(
+        table_data,
+        colWidths=[2 * cm, 3 * cm, 3.5 * cm, 3.5 * cm, 3 * cm],
+        repeatRows=1
+    )
+
+    sales_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#263B5E")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+        ("PADDING", (0, 0), (-1, -1), 7),
+    ]))
+
+    elements.append(sales_table)
+
+    doc.build(elements)
+
+    response = HttpResponse(
+        buffer.getvalue(),
+        content_type="application/pdf"
+    )
+    filename = f"SaleReport_{timezone.now().strftime('%Y%m%d')}.pdf"
+    response["Content-Disposition"] = f'inline; filename="{filename}"'
+
+    return response
 
 def admin_walkin_success(request, bill_id):
     bill = get_object_or_404(Bill, id=bill_id, is_walkin=True)
